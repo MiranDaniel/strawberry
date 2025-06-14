@@ -1,0 +1,5 @@
+[default]
+port = 8000
+
+[default.app]
+image_directory = "/home/cat/Documents/strawberry/img"

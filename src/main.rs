@@ -24,16 +24,16 @@ struct ImageParams {
 impl ImageParams {
     // Generate cache directory name based on parameters
     fn cache_dir_name(&self) -> Option<String> {
-        Some("cache/".to_string()+&match (self.w, self.h, self.q) {
-            (Some(w), Some(h), Some(q)) => Some(format!("w{}h{}q{}", w, h, q)),
-            (Some(w), Some(h), None) => Some(format!("w{}h{}", w, h)),
-            (Some(w), None, Some(q)) => Some(format!("w{}q{}", w, q)),
-            (None, Some(h), Some(q)) => Some(format!("h{}q{}", h, q)),
-            (None, Some(h), None) => Some(format!("h{}", h)),
-            (Some(w), None, None) => Some(format!("w{}", w)),
-            (None, None, Some(q)) => Some(format!("q{}", q)),
-            (None, None, None) => None,
-        }.unwrap())
+        match (self.w, self.h, self.q) {
+            (Some(w), Some(h), Some(q)) => Some(format!("cache/w{}h{}q{}", w, h, q)),
+            (Some(w), Some(h), None) => Some(format!("cache/w{}h{}", w, h)),
+            (Some(w), None, Some(q)) => Some(format!("cache/w{}q{}", w, q)),
+            (None, Some(h), Some(q)) => Some(format!("cache/h{}q{}", h, q)),
+            (None, Some(h), None) => Some(format!("cache/h{}", h)),
+            (Some(w), None, None) => Some(format!("cache/w{}", w)),
+            (None, None, Some(q)) => Some(format!("cache/q{}", q)),
+            (None, None, None) => None,  // No parameters = no cache directory
+        }
     }
 }
 
@@ -61,19 +61,21 @@ async fn index() -> Result<NamedFile, NotFound<String>> {
     Err(NotFound("index.html not found".to_string()))
 }
 
-#[get("/<filename>?<params..>")]
+#[get("/<path..>?<params..>")]
 async fn serve_image(
-    filename: PathBuf,
+    path: PathBuf,
     params: Option<ImageParams>,
     config: &State<Config>,
 ) -> Result<(ContentType, Vec<u8>), NotFound<String>> {
-    // Security check for filename
-    if filename.to_str().map_or(true, |s| s.contains("..")) {
-        return Err(NotFound("Invalid filename".to_string()));
+    // Security check for path - no parent directory traversal
+    for component in path.components() {
+        if let std::path::Component::ParentDir = component {
+            return Err(NotFound("Invalid path".to_string()));
+        }
     }
 
     // Determine content type from extension
-    let content_type = match filename.extension().and_then(|s| s.to_str()) {
+    let content_type = match path.extension().and_then(|s| s.to_str()) {
         Some("png") => ContentType::PNG,
         Some("jpg") | Some("jpeg") => ContentType::JPEG,
         Some("gif") => ContentType::GIF,
@@ -85,8 +87,9 @@ async fn serve_image(
     // Check if we need to process the image
     if let Some(ref params) = params {
         if let Some(cache_dir) = params.cache_dir_name() {
-            // Check if cached version exists
-            let cache_path = config.image_dir.join(&cache_dir).join(&filename);
+            // Create cache path maintaining directory structure
+            let cache_base = config.image_dir.join(&cache_dir);
+            let cache_path = cache_base.join(&path);
             
             if cache_path.exists() && cache_path.is_file() {
                 // Serve from cache
@@ -97,10 +100,10 @@ async fn serve_image(
             }
             
             // Need to process and cache
-            let original_path = config.image_dir.join(&filename);
+            let original_path = config.image_dir.join(&path);
             
             if !original_path.exists() || !original_path.is_file() {
-                return Err(NotFound(format!("Image not found: {:?}", filename)));
+                return Err(NotFound(format!("Image not found: {:?}", path)));
             }
 
             // Load and process the image
@@ -113,16 +116,17 @@ async fn serve_image(
             let processed_img = process_image(img, params.clone());
 
             // Convert to bytes
-            let image_data = encode_image(&processed_img, &filename, quality)?;
+            let image_data = encode_image(&processed_img, &path, quality)?;
 
-            // Save to cache
-            let cache_dir_path = config.image_dir.join(&cache_dir);
-            if let Err(e) = std::fs::create_dir_all(&cache_dir_path) {
-                eprintln!("Failed to create cache directory: {}", e);
-            } else if let Err(e) = std::fs::write(&cache_path, &image_data) {
-                eprintln!("Failed to write to cache: {}", e);
-            } else {
-                println!("Cached processed image: {:?}", cache_path);
+            // Create cache directory structure (including subdirectories)
+            if let Some(parent) = cache_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("Failed to create cache directory: {}", e);
+                } else if let Err(e) = std::fs::write(&cache_path, &image_data) {
+                    eprintln!("Failed to write to cache: {}", e);
+                } else {
+                    println!("Cached processed image: {:?}", cache_path);
+                }
             }
 
             return Ok((content_type, image_data));
@@ -130,15 +134,15 @@ async fn serve_image(
     }
 
     // No parameters, serve original
-    let original_path = config.image_dir.join(&filename);
+    let original_path = config.image_dir.join(&path);
     
     if !original_path.exists() || !original_path.is_file() {
-        return Err(NotFound(format!("Image not found: {:?}", filename)));
+        return Err(NotFound(format!("Image not found: {:?}", path)));
     }
 
     match std::fs::read(&original_path) {
         Ok(data) => Ok((content_type, data)),
-        Err(_) => Err(NotFound(format!("Failed to read image: {:?}", filename))),
+        Err(_) => Err(NotFound(format!("Failed to read image: {:?}", path))),
     }
 }
 
@@ -208,21 +212,26 @@ fn process_image(mut img: DynamicImage, params: ImageParams) -> DynamicImage {
     img
 }
 
-#[get("/<filename>", rank = 2)]
+#[get("/<path..>", rank = 2)]
 async fn serve_original_image(
-    filename: PathBuf,
+    path: PathBuf,
     config: &State<Config>,
 ) -> Result<NamedFile, NotFound<String>> {
-    let image_path = config.image_dir.join(&filename);
+    let image_path = config.image_dir.join(&path);
     
-    // Security check
-    if !image_path.starts_with(&config.image_dir) {
+    // Security check - ensure the resolved path is within the image directory
+    let canonical_base = config.image_dir.canonicalize()
+        .map_err(|_| NotFound("Invalid base directory".to_string()))?;
+    let canonical_image = image_path.canonicalize()
+        .map_err(|_| NotFound("Image not found".to_string()))?;
+    
+    if !canonical_image.starts_with(&canonical_base) {
         return Err(NotFound("Invalid path".to_string()));
     }
 
     NamedFile::open(&image_path)
         .await
-        .map_err(|_| NotFound(format!("Image not found: {:?}", filename)))
+        .map_err(|_| NotFound(format!("Image not found: {:?}", path)))
 }
 
 #[launch]
